@@ -6,7 +6,7 @@ from typing import List, Optional
 from bson import ObjectId
 
 from database import db, create_document, get_documents
-from schemas import Rank as RankSchema, Order as OrderSchema
+from schemas import Rank as RankSchema, Order as OrderSchema, Promo as PromoSchema
 
 app = FastAPI(title="Minecraft Autodonate API")
 
@@ -52,7 +52,7 @@ class CreateRank(BaseModel):
     name: str
     description: str
     price: float = Field(ge=0)
-    color: str = "#22d3ee"
+    color: str = "#f59e0b"  # amber default
     perks: List[str] = []
     popular: bool = False
     icon: Optional[str] = None
@@ -60,21 +60,37 @@ class CreateRank(BaseModel):
 class RankResponse(CreateRank):
     id: ObjectIdStr
 
+class CartItem(BaseModel):
+    rank_id: str
+    quantity: int = Field(1, ge=1)
+
 class CreateOrder(BaseModel):
     player: str = Field(..., description="Minecraft nickname")
-    rank_id: str = Field(..., description="Rank ID")
+    items: List[CartItem]
     email: Optional[str] = None
     server: Optional[str] = None
+    promo_code: Optional[str] = None
+
+class OrderItemResponse(BaseModel):
+    rank_id: str
+    quantity: int
+    price: float
 
 class OrderResponse(BaseModel):
     id: ObjectIdStr
     player: str
-    rank_id: str
+    items: List[OrderItemResponse]
     amount: float
     currency: str = "RUB"
     status: str
     email: Optional[str] = None
     server: Optional[str] = None
+    promo_code: Optional[str] = None
+
+class PromoResponse(BaseModel):
+    code: str
+    discount_percent: float
+    active: bool
 
 # --------- Routes ---------
 @app.get("/")
@@ -138,7 +154,7 @@ def seed_ranks():
             "name": "VIP",
             "description": "Стартовый донат с базовыми привилегиями",
             "price": 149,
-            "color": "#10b981",
+            "color": "#b45309",  # amber-700
             "perks": [
                 "/kit vip",
                 "+2 сетхомы",
@@ -151,7 +167,7 @@ def seed_ranks():
             "name": "Premium",
             "description": "Расширенные возможности и бонусы",
             "price": 299,
-            "color": "#3b82f6",
+            "color": "#d97706",  # amber-600
             "perks": [
                 "/repair",
                 "+5 сетхомов",
@@ -164,7 +180,7 @@ def seed_ranks():
             "name": "Deluxe",
             "description": "Максимальные привилегии для истинных ценителей",
             "price": 599,
-            "color": "#f59e0b",
+            "color": "#f59e0b",  # amber-500
             "perks": [
                 "/fly",
                 "+10 сетхомов",
@@ -177,35 +193,92 @@ def seed_ranks():
     for d in defaults:
         schema = RankSchema(**d)
         create_document("rank", schema)
+    # seed a demo promo
+    if db["promo"].count_documents({"code": "START"}) == 0:
+        create_document("promo", PromoSchema(code="START", discount_percent=10, active=True))
     return {"message": "Seeded"}
+
+# Promos
+@app.get("/api/promos/{code}", response_model=PromoResponse)
+def get_promo(code: str):
+    doc = db["promo"].find_one({"code": code.upper()})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Promo not found")
+    d = serialize_doc(doc)
+    return PromoResponse(code=d.get("code", code.upper()), discount_percent=d.get("discount_percent", 0.0), active=d.get("active", False))
+
+@app.post("/api/promos")
+def create_promo(payload: PromoSchema):
+    new_id = create_document("promo", payload)
+    doc = db["promo"].find_one({"_id": ObjectId(new_id)})
+    return serialize_doc(doc)
 
 # Orders
 @app.post("/api/orders", response_model=OrderResponse)
 def create_order(payload: CreateOrder):
-    # validate rank exists
-    try:
-        rank = db["rank"].find_one({"_id": ObjectId(payload.rank_id)})
-    except Exception:
-        rank = None
-    if not rank:
-        raise HTTPException(status_code=404, detail="Rank not found")
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+
+    # build items with prices and compute total
+    items_resp = []
+    total = 0.0
+    for it in payload.items:
+        try:
+            rank = db["rank"].find_one({"_id": ObjectId(it.rank_id)})
+        except Exception:
+            rank = None
+        if not rank:
+            raise HTTPException(status_code=404, detail=f"Rank not found: {it.rank_id}")
+        price = float(rank.get("price", 0))
+        items_resp.append({"rank_id": str(rank["_id"]), "quantity": it.quantity, "price": price})
+        total += price * it.quantity
+
+    applied_promo = None
+    if payload.promo_code:
+        promo = db["promo"].find_one({"code": payload.promo_code.upper(), "active": True})
+        if promo:
+            applied_promo = promo
+            discount_percent = float(promo.get("discount_percent", 0))
+            total = round(total * (1 - discount_percent / 100.0), 2)
+        else:
+            # ignore invalid promo silently or raise?
+            raise HTTPException(status_code=404, detail="Promo not found or inactive")
 
     order_data = OrderSchema(
         player=payload.player,
-        rank_id=str(rank["_id"]),
-        amount=float(rank.get("price", 0)),
+        items=[
+            {
+                "rank_id": it["rank_id"],
+                "quantity": it["quantity"],
+                "price": it["price"],
+            }
+            for it in items_resp
+        ],
+        amount=total,
         currency="RUB",
         status="pending",
         email=payload.email,
         server=payload.server,
+        promo_code=payload.promo_code.upper() if applied_promo else None,
     )
+
     new_id = create_document("order", order_data)
     doc = db["order"].find_one({"_id": ObjectId(new_id)})
-    return OrderResponse(**serialize_doc(doc))
+    d = serialize_doc(doc)
+    return OrderResponse(
+        id=d["id"],
+        player=d["player"],
+        items=[OrderItemResponse(**i) for i in d.get("items", [])],
+        amount=d["amount"],
+        currency=d.get("currency", "RUB"),
+        status=d["status"],
+        email=d.get("email"),
+        server=d.get("server"),
+        promo_code=d.get("promo_code"),
+    )
 
 @app.post("/api/orders/{order_id}/pay", response_model=OrderResponse)
 def simulate_pay(order_id: str):
-    # Simulate payment success and mark as paid
     try:
         _id = ObjectId(order_id)
     except Exception:
@@ -217,7 +290,18 @@ def simulate_pay(order_id: str):
     )
     if not res:
         raise HTTPException(status_code=404, detail="Order not found")
-    return OrderResponse(**serialize_doc(res))
+    d = serialize_doc(res)
+    return OrderResponse(
+        id=d["id"],
+        player=d["player"],
+        items=[OrderItemResponse(**i) for i in d.get("items", [])],
+        amount=d["amount"],
+        currency=d.get("currency", "RUB"),
+        status=d["status"],
+        email=d.get("email"),
+        server=d.get("server"),
+        promo_code=d.get("promo_code"),
+    )
 
 
 if __name__ == "__main__":
